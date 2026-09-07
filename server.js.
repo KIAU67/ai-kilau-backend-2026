@@ -1,0 +1,146 @@
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';
+const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'openrouter/free';
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+
+app.use(cors({ origin: true }));
+app.use(express.json({ limit: '1mb' }));
+
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    service: 'AI KILAU Backend',
+    status: OPENROUTER_API_KEY ? 'ready' : 'missing OPENROUTER_API_KEY',
+    endpoints: { health: 'GET /', chat: 'POST /chat' }
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+function getLanguageName(code) {
+  const map = {
+    Indonesia: 'Bahasa Indonesia',
+    English: 'English',
+    Melayu: 'Bahasa Melayu',
+    Chinese: 'Chinese (中文)',
+    Arabic: 'Arabic (العربية)',
+    Thai: 'Thai (ภาษาไทย)',
+    Vietnamese: 'Vietnamese (Tiếng Việt)'
+  };
+  return map[code] || 'Bahasa Indonesia';
+}
+
+function buildSystemPrompt(langCode) {
+  const langName = getLanguageName(langCode || 'Indonesia');
+  return `You are AI KILAU — advanced AI assistant.
+
+CRITICAL LANGUAGE RULE:
+You MUST reply 100% in ${langName}.
+Every word and sentence must be in ${langName}.
+Do not mix languages.
+
+Be truthful, clear, helpful, and expert across all fields.
+Always respond in ${langName}.`;
+}
+
+app.post('/chat', async (req, res) => {
+  try {
+    if (!OPENROUTER_API_KEY) {
+      return res.status(500).json({
+        error: 'Server belum dikonfigurasi. Set OPENROUTER_API_KEY.'
+      });
+    }
+
+    const {
+      message,
+      language = 'Indonesia',
+      history = [],
+      model = DEFAULT_MODEL,
+      temperature = 0.7,
+      stream = true
+    } = req.body || {};
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      return res.status(400).json({ error: 'message wajib diisi' });
+    }
+
+    const safeHistory = Array.isArray(history) ? history.slice(-12) : [];
+
+    const messages = [
+      { role: 'system', content: buildSystemPrompt(language) },
+      ...safeHistory.map((m) => ({
+        role: m.role === 'ai' || m.role === 'assistant' ? 'assistant' : 'user',
+        content: String(m.content || '')
+      })),
+      { role: 'user', content: message.trim() }
+    ];
+
+    const payload = {
+      model,
+      messages,
+      temperature: Number(temperature) || 0.7,
+      stream: !!stream
+    };
+
+    const upstream = await fetch(OPENROUTER_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        'HTTP-Referer': 'https://ai-kilau.app',
+        'X-Title': 'AI KILAU'
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!upstream.ok) {
+      const errText = await upstream.text();
+      return res.status(upstream.status).json({
+        error: `OpenRouter error ${upstream.status}`,
+        detail: errText.slice(0, 500)
+      });
+    }
+
+    if (stream && upstream.body) {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+
+      const reader = upstream.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(decoder.decode(value, { stream: true }));
+      }
+      return res.end();
+    }
+
+    const data = await upstream.json();
+    const reply =
+      data?.choices?.[0]?.message?.content ||
+      data?.choices?.[0]?.delta?.content ||
+      '';
+
+    return res.json({ reply, raw: data });
+  } catch (err) {
+    console.error('Chat error:', err);
+    return res.status(500).json({
+      error: 'Internal server error',
+      detail: String(err.message || err)
+    });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`AI KILAU backend running on port ${PORT}`);
+  console.log(`API Key configured: ${OPENROUTER_API_KEY ? 'YES' : 'NO'}`);
+});
